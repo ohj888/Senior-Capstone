@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.env
+*.pt
+*.pth
+*.pth.tar
+D:\School Stuff\shanghai work\Senior Capstone\oh2087 Oliver HJ  project positionsing presentation.mp4
