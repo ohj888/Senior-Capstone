@@ -1,3 +1,6 @@
+# Downloaded third-party source (recreated by code/download_dependencies.ipynb)
+/dependencies/
+
 .venv/
 __pycache__/
 .ipynb_checkpoints/
