@@ -9,3 +9,5 @@ __pycache__/
 *.pth
 *.pth.tar
 oh2087 Oliver HJ  project positionsing presentation.mp4
+dataset rgb only/
+dataset/
