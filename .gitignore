@@ -11,3 +11,6 @@ __pycache__/
 oh2087 Oliver HJ  project positionsing presentation.mp4
 dataset rgb only/
 dataset/
+
+# Local LoRA runs/checkpoints are reproducible outputs, not source files.
+/artifacts/lora_baselines/
