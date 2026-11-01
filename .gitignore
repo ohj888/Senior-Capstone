@@ -13,4 +13,4 @@ dataset rgb only/
 dataset/
 
 # Local LoRA runs/checkpoints are reproducible outputs, not source files.
-/artifacts/lora_baselines/
+/artifacts/
