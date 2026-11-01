@@ -104,7 +104,10 @@ def scene_group(relative_scene, overrides=None):
     return f"{family}/{match.group(1) if match else name}"
 
 
-def assign_splits(scenes, seed=42, overrides=None):
+def assign_splits(scenes, seed=42, overrides=None, *, validation_fraction=0.2, test_fraction=0.2):
+    if not (0 < validation_fraction < 1 and 0 < test_fraction < 1
+            and validation_fraction + test_fraction < 1):
+        raise ValueError("validation_fraction and test_fraction must be positive and sum to less than one.")
     groups_by_family = defaultdict(set)
     group_for_scene = {}
     for name in sorted(scenes):
@@ -117,9 +120,12 @@ def assign_splits(scenes, seed=42, overrides=None):
         if len(groups) < 3:
             raise ValueError(f"Need at least three independent groups in {family} to split train/validation/test.")
         random.Random(f"{seed}:{family}").shuffle(groups)
-        held_out = max(1, round(len(groups) * 0.2))
+        test_groups = max(1, round(len(groups) * test_fraction))
+        validation_groups = max(1, round(len(groups) * validation_fraction))
+        if test_groups + validation_groups >= len(groups):
+            raise ValueError(f"Requested split fractions leave no training groups in {family}; use smaller held-out fractions.")
         for i, group in enumerate(groups):
-            split = "test" if i < held_out else "validation" if i < 2 * held_out else "train"
+            split = "test" if i < test_groups else "validation" if i < test_groups + validation_groups else "train"
             if group in split_for_group and split_for_group[group] != split:
                 raise ValueError("A group override spans families with conflicting splits.")
             split_for_group[group] = split
@@ -134,7 +140,7 @@ def semantic_components(labels, grid_size=128):
     """
     if labels.ndim != 2:
         raise ValueError("Expected a 2D semantic class-ID image.")
-    step = max(1, math.ceil(max(labels.shape) / grid_size))
+    step = 1 if grid_size is None else max(1, math.ceil(max(labels.shape) / grid_size))
     grid = labels[::step, ::step]
     height, width = grid.shape
     visited = np.zeros(grid.shape, dtype=bool)
@@ -164,11 +170,21 @@ def semantic_components(labels, grid_size=128):
 def prepare_examples(data_root, settings=None):
     data_root = Path(data_root)
     cfg = {**DEFAULT_DATA, **(settings or {})}
+    for field in ("frames_per_scene", "max_regions_per_frame", "max_examples_per_class_per_scene", "component_grid_size", "image_max_side"):
+        value = cfg[field]
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            raise ValueError(f"{field} must be a positive integer, or None to remove that limit.")
+    if cfg["min_grid_area"] < 1 or cfg["min_box_side"] < 1:
+        raise ValueError("min_grid_area and min_box_side must be positive.")
+    if not 0 <= cfg["min_category_fraction"] <= 1 or cfg["crop_margin"] < 0:
+        raise ValueError("min_category_fraction must be in [0, 1], and crop_margin must be nonnegative.")
     scenes = sorted(p.parent for p in data_root.glob("*/*/traj.txt"))
     if not scenes:
         raise FileNotFoundError(f"No OSMa-Bench scenes at {data_root}")
     names = [p.relative_to(data_root).as_posix() for p in scenes]
-    splits = assign_splits(names, cfg["seed"], cfg["group_overrides"])
+    splits = assign_splits(names, cfg["seed"], cfg["group_overrides"],
+                           validation_fraction=cfg.get("validation_fraction", 0.2),
+                           test_fraction=cfg.get("test_fraction", 0.2))
     rows, sources = [], []
     excluded = {normalize_label(x) for x in cfg["excluded_classes"]}
     def source_record(path):
@@ -186,7 +202,8 @@ def prepare_examples(data_root, settings=None):
                    for c in json.loads(classes_path.read_text(encoding="utf-8"))["classes"]}
         source_record(classes_path)
         frames = sorted((scene / "results").glob("frame*.jpg"))
-        selected = np.linspace(0, len(frames) - 1, min(cfg["frames_per_scene"], len(frames)), dtype=int)
+        frame_count = len(frames) if cfg["frames_per_scene"] is None else min(cfg["frames_per_scene"], len(frames))
+        selected = np.linspace(0, len(frames) - 1, frame_count, dtype=int)
         class_counts = Counter()
         for index in selected:
             rgb_path = frames[index]
@@ -227,7 +244,7 @@ def prepare_examples(data_root, settings=None):
             random.Random(f"{cfg['seed']}:{name}:{frame}").shuffle(candidates)
             accepted = 0
             for target, category, box, purity in candidates:
-                if class_counts[target] >= cfg["max_examples_per_class_per_scene"]:
+                if cfg["max_examples_per_class_per_scene"] is not None and class_counts[target] >= cfg["max_examples_per_class_per_scene"]:
                     continue
                 key = {"scene": name, "frame": frame, "bbox": box, "category_id": category}
                 # Store provenance separately from the VLM input:
@@ -239,7 +256,7 @@ def prepare_examples(data_root, settings=None):
                              "proposal_source": "gt_semantic_connected_region"})
                 class_counts[target] += 1
                 accepted += 1
-                if accepted >= cfg["max_regions_per_frame"]:
+                if cfg["max_regions_per_frame"] is not None and accepted >= cfg["max_regions_per_frame"]:
                     break
         print(f"Prepared {name}: {sum(class_counts.values())} region examples ({splits[name]['split']}).")
     for split in ("train", "validation", "test"):
@@ -262,7 +279,8 @@ def load_crop(row, data_root, max_side=384):
         # 4. Crop the ordinary RGB photograph, NOT the semantic mask.
         # The mask guided localization, but the VLM sees natural RGB pixels.
         crop = image.convert("RGB").crop((x0, y0, x1, y1))
-        crop.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        if max_side is not None:
+            crop.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         return crop
 
 
@@ -311,17 +329,48 @@ def encode_messages(processor, messages, target=None):
     return full
 
 
+def encode_message_batch(processor, conversations, targets):
+    """Batch with the model's processor; mask padding and every prompt token.
+
+    Separate pixel tensors cannot be concatenated generically across VLMs.
+    Processing complete conversations together preserves image/grid alignment.
+    """
+    import torch
+    if not conversations or len(conversations) != len(targets):
+        raise ValueError("Provide one target for every nonempty conversation batch.")
+    if len(conversations) == 1:
+        return encode_messages(processor, conversations[0], targets[0])
+    kwargs = {"tokenize": True, "return_dict": True,
+              "processor_kwargs": {"return_tensors": "pt", "padding": True}}
+    prompts = processor.apply_chat_template(conversations, add_generation_prompt=True, **kwargs)
+    answers = [list(messages) + [{"role": "assistant", "content": [{"type": "text", "text": target}]}]
+               for messages, target in zip(conversations, targets)]
+    full = processor.apply_chat_template(answers, add_generation_prompt=False, **kwargs)
+    labels = torch.full_like(full["input_ids"], -100)
+    for index in range(len(conversations)):
+        prompt_ids = prompts["input_ids"][index][prompts["attention_mask"][index].bool()]
+        positions = full["attention_mask"][index].nonzero(as_tuple=True)[0]
+        full_ids = full["input_ids"][index, positions]
+        if not torch.equal(full_ids[:len(prompt_ids)], prompt_ids):
+            raise ValueError("Chat-template prefix mismatch in batched answer masking.")
+        answer_positions = positions[len(prompt_ids):]
+        if not len(answer_positions):
+            raise ValueError("There are no assistant target tokens to train on.")
+        labels[index, answer_positions] = full["input_ids"][index, answer_positions]
+    full["labels"] = labels
+    return full
+
+
 class RegionCollator:
     def __init__(self, processor, data_root, max_side=384):
         self.processor, self.data_root, self.max_side = processor, data_root, max_side
 
     def __call__(self, examples):
-        if len(examples) != 1:
-            raise ValueError("This teaching collator supports microbatch size 1; use gradient accumulation.")
-        row = examples[0]
         # Complete bridge: RGB crop + fixed question -> category text from OSMa.
         # During training the loss updates LoRA parameters, not the dataset labels.
-        return encode_example(self.processor, load_crop(row, self.data_root, self.max_side), row["target"])
+        return encode_message_batch(self.processor,
+            [user_message(load_crop(row, self.data_root, self.max_side)) for row in examples],
+            [row["target"] for row in examples])
 
 
 def decoder_lora_targets(model):
@@ -335,22 +384,26 @@ def decoder_lora_targets(model):
     return targets
 
 
-def attach_lora(model, rank=8, alpha=16, dropout=0.05):
+def attach_lora(model, rank=8, alpha=16, dropout=0.05, target_modules=None, lora_options=None):
     from peft import LoraConfig, get_peft_model
-    targets = decoder_lora_targets(model)
-    config = LoraConfig(task_type="CAUSAL_LM", r=rank, lora_alpha=alpha,
-                        lora_dropout=dropout, target_modules=targets, bias="none")
+    targets = decoder_lora_targets(model) if target_modules is None else target_modules
+    options = {"task_type": "CAUSAL_LM", "r": rank, "lora_alpha": alpha,
+               "lora_dropout": dropout, "target_modules": targets, "bias": "none",
+               **(lora_options or {})}
+    config = LoraConfig(**options)
     model = get_peft_model(model, config)
     trainable = [(name, p.numel()) for name, p in model.named_parameters() if p.requires_grad]
-    if not trainable or any("lora_" not in name for name, _ in trainable):
+    explicit_extra_parameters = bool(options.get("modules_to_save") or options.get("trainable_token_indices")
+                                    or options.get("bias") != "none")
+    if not trainable or (not explicit_extra_parameters and any("lora_" not in name for name, _ in trainable)):
         raise RuntimeError("Unexpected trainable base parameters; stop before training.")
     model.print_trainable_parameters()
     return model, config, trainable
 
 
-def local_model_path(project_root, model_key):
+def local_model_path(project_root, model_key, path=None):
     spec = MODELS[model_key]
-    path = Path(project_root) / "dependencies" / "models" / spec["folder"]
+    path = Path(path) if path is not None else Path(project_root) / "dependencies" / "models" / spec["folder"]
     manifest_path = path / ".baseline-manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Run the baseline model cell in download_dependencies.ipynb first: {path}")
@@ -386,44 +439,79 @@ def check_processor_dependencies(model_key):
         raise ImportError("num2words is installed, but SmolVLM cached it as unavailable. Restart the notebook kernel, then rerun.")
 
 
-def load_local_base(project_root, model_key, use_4bit=True):
+def _configure_image_processor(processor, model_key, loading, defaults=True):
+    options = dict(loading.get("image_processor", {}))
+    if model_key == "qwen":
+        if defaults or "qwen_min_pixels" in loading or "qwen_max_pixels" in loading:
+            options.setdefault("size", {"shortest_edge": loading.get("qwen_min_pixels", 4 * 32 * 32),
+                                        "longest_edge": loading.get("qwen_max_pixels", 160 * 32 * 32)})
+    elif defaults or "smolvlm_image_splitting" in loading:
+        options.setdefault("do_image_splitting", loading.get("smolvlm_image_splitting", False))
+    for name, value in options.items():
+        setattr(processor.image_processor, name, value)
+
+
+def load_local_base(project_root, model_key, use_4bit=True, loading=None):
+    """Load verified local weights. No remote/model-hub fallback is permitted.
+
+    loading keys: model_path, device (auto/cpu/cuda:N), device_map, dtype
+    (auto/float32/float16/bfloat16), attn_implementation, qwen_min_pixels,
+    qwen_max_pixels, smolvlm_image_splitting, image_processor, processor_kwargs,
+    model_kwargs, and quantization_kwargs. CPU uses unquantized float32 by default.
+    """
     check_processor_dependencies(model_key)
     import torch
     from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration, SmolVLMForConditionalGeneration
-    if not torch.cuda.is_available():
-        raise RuntimeError("This training pilot requires CUDA. Preparation/preview cells work without a GPU.")
-    path = local_model_path(project_root, model_key)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
-    if model_key == "qwen":
-        # Bound the image-token budget; the class crop still preserves aspect ratio.
-        processor.image_processor.size = {"shortest_edge": 4 * 32 * 32, "longest_edge": 160 * 32 * 32}
-        cls = Qwen3VLForConditionalGeneration
-    else:
-        processor.image_processor.do_image_splitting = False
-        cls = SmolVLMForConditionalGeneration
+    cfg = dict(loading or {})
+    path = local_model_path(project_root, model_key, cfg.get("model_path"))
+    device = cfg.get("device", "auto")
+    if device == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable in this kernel; select device='cpu' and use_4bit=False.")
+    if use_4bit and (str(device) == "cpu" or not torch.cuda.is_available()):
+        raise ValueError("This NF4 setup requires CUDA; set use_4bit=False for local CPU execution.")
+    dtype = cfg.get("dtype", "auto")
+    if dtype == "auto":
+        dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if str(device).startswith("cuda") else torch.float32
+    elif isinstance(dtype, str):
+        if dtype not in ("float32", "float16", "bfloat16"):
+            raise ValueError("dtype must be auto, float32, float16, or bfloat16.")
+        dtype = getattr(torch, dtype)
+    processor_options = {**cfg.get("processor_kwargs", {}), "local_files_only": True, "trust_remote_code": False}
+    processor = AutoProcessor.from_pretrained(path, **processor_options)
+    _configure_image_processor(processor, model_key, cfg)
+    cls = Qwen3VLForConditionalGeneration if model_key == "qwen" else SmolVLMForConditionalGeneration
     kwargs = {"local_files_only": True, "trust_remote_code": False, "dtype": dtype,
-              "device_map": {"": 0}, "attn_implementation": "sdpa"}
+              "device_map": cfg.get("device_map", {"": device}),
+              "attn_implementation": cfg.get("attn_implementation", "sdpa"), **cfg.get("model_kwargs", {})}
+    kwargs.update(local_files_only=True, trust_remote_code=False)
     if use_4bit:
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                                           bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype)
+        quantization = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True,
+                        "bnb_4bit_compute_dtype": dtype, **cfg.get("quantization_kwargs", {})}
+        kwargs["quantization_config"] = BitsAndBytesConfig(**quantization)
     model = cls.from_pretrained(path, **kwargs)
+    model._capstone_loading = cfg
     return model, processor
 
 
-def load_trainable(project_root, model_key, rank=8, alpha=16, dropout=0.05, use_4bit=True, seed=42):
+def load_trainable(project_root, model_key, rank=8, alpha=16, dropout=0.05, use_4bit=True, seed=42,
+                   loading=None, target_modules=None, lora_options=None, gradient_checkpointing=True,
+                   gradient_checkpointing_kwargs=None):
     from peft import prepare_model_for_kbit_training
     from transformers import set_seed
     set_seed(seed)  # Seed adapter initialization, not just the later training loop.
-    model, processor = load_local_base(project_root, model_key, use_4bit)
+    model, processor = load_local_base(project_root, model_key, use_4bit, loading=loading)
+    checkpointing_kwargs = gradient_checkpointing_kwargs or {"use_reentrant": False}
     if use_4bit:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True,
-                                               gradient_checkpointing_kwargs={"use_reentrant": False})
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing,
+                                               gradient_checkpointing_kwargs=checkpointing_kwargs)
     else:
         model.requires_grad_(False)
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpointing_kwargs)
     model.config.use_cache = False
-    model, config, parameters = attach_lora(model, rank, alpha, dropout)
+    model, config, parameters = attach_lora(model, rank, alpha, dropout, target_modules, lora_options)
     return model, processor, config, parameters
 
 
@@ -442,7 +530,7 @@ def classification_metrics(predictions):
             "classes_evaluated": len(by_class)}
 
 
-def predict_rows(model, processor, rows, data_root, max_side=384, disable_adapter=False):
+def predict_rows(model, processor, rows, data_root, max_side=384, disable_adapter=False, generation=None):
     import torch
     was_training = model.training
     model.eval()
@@ -455,7 +543,7 @@ def predict_rows(model, processor, rows, data_root, max_side=384, disable_adapte
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 start = time.perf_counter()
-                generated = model.generate(**batch, max_new_tokens=24, do_sample=False)
+                generated = model.generate(**batch, **{"max_new_tokens": 24, "do_sample": False, **(generation or {})})
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 answer = processor.batch_decode(generated[:, batch["input_ids"].shape[1]:], skip_special_tokens=True)[0]
@@ -468,28 +556,70 @@ def predict_rows(model, processor, rows, data_root, max_side=384, disable_adapte
 
 
 def training_arguments(output_dir, training, seed, train_examples, use_cpu=False):
-    """Validate Trainer options before running expensive baseline predictions."""
+    """Configurable local Trainer arguments, with backwards-compatible aliases.
+
+    Standard TrainingArguments fields can be set directly. The notebook aliases
+    epochs, accumulation, batch_size, and eval_batch_size are also accepted.
+    warmup_ratio is converted to explicit update steps for Transformers versions
+    that removed it. eval_examples and generation configure prediction passes.
+    """
     import torch
     from transformers import TrainingArguments
-    # warmup_ratio was removed from newer Transformers releases. An explicit
-    # integer warmup_steps also works with older releases supporting these VLMs.
-    # This notebook uses one GPU and a microbatch of one.
-    steps_per_epoch = math.ceil(train_examples / training["accumulation"])
-    total_steps = (training["max_steps"] if training["max_steps"] > 0
-                   else math.ceil(steps_per_epoch * training["epochs"]))
-    bf16 = not use_cpu and torch.cuda.is_bf16_supported()
-    return TrainingArguments(
-        output_dir=str(Path(output_dir) / "checkpoints"), max_steps=training["max_steps"], num_train_epochs=training["epochs"],
-        per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=training["accumulation"],
-        learning_rate=training["learning_rate"], warmup_steps=math.ceil(total_steps * 0.05), optim="adamw_torch",
+    settings = dict(training or {})
+    aliases = {"epochs": "num_train_epochs", "accumulation": "gradient_accumulation_steps",
+               "batch_size": "per_device_train_batch_size", "eval_batch_size": "per_device_eval_batch_size"}
+    for old, new in aliases.items():
+        if old in settings:
+            value = settings.pop(old)
+            if new in settings and settings[new] != value:
+                raise ValueError(f"Conflicting training settings: {old} and {new}.")
+            settings[new] = value
+    for helper_key in ("eval_examples", "generation"):
+        settings.pop(helper_key, None)
+    precision = settings.pop("precision", "auto")
+    if precision not in ("auto", "float32", "fp32", "fp16", "bf16"):
+        raise ValueError("precision must be auto, float32/fp32, fp16, or bf16.")
+    if precision != "auto":
+        settings.setdefault("fp16", precision == "fp16")
+        settings.setdefault("bf16", precision == "bf16")
+    warmup_ratio = settings.pop("warmup_ratio", 0.05)
+    if not 0 <= warmup_ratio <= 1:
+        raise ValueError("warmup_ratio must be between zero and one.")
+    if settings.get("push_to_hub", False) or settings.get("report_to", "none") not in ("none", None, []):
+        raise ValueError("This local pipeline keeps push_to_hub=False and report_to='none'.")
+    cpu = bool(settings.get("use_cpu", use_cpu or not torch.cuda.is_available()))
+    bf16 = not cpu and torch.cuda.is_bf16_supported()
+    default_strategy = "epoch" if settings.get("max_steps", -1) < 0 else "steps"
+    options = dict(
+        output_dir=str(Path(output_dir) / "checkpoints"), max_steps=-1, num_train_epochs=3,
+        per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=4,
+        learning_rate=1e-4, warmup_steps=0, optim="adamw_torch", weight_decay=0.0,
         gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
-        use_cpu=use_cpu, bf16=bf16, fp16=not use_cpu and not bf16,
-        eval_strategy="steps", eval_steps=training["eval_steps"],
-        save_strategy="steps", save_steps=training["eval_steps"], save_total_limit=2,
-        load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False,
+        use_cpu=cpu, bf16=bf16, fp16=not cpu and not bf16,
+        eval_strategy=default_strategy, eval_steps=10, save_strategy=default_strategy, save_steps=10,
+        save_total_limit=2, metric_for_best_model="eval_loss", greater_is_better=False,
         logging_steps=5, report_to="none", push_to_hub=False, remove_unused_columns=False,
-        label_names=["labels"], dataloader_num_workers=0, seed=seed,
-    )
+        label_names=["labels"], dataloader_num_workers=0, seed=seed)
+    options.update(settings)
+    if "fp16" in settings and "bf16" not in settings:
+        options["bf16"] = False
+    if "bf16" in settings and "fp16" not in settings:
+        options["fp16"] = False
+    if "save_steps" not in settings:
+        options["save_steps"] = options["eval_steps"]
+    options.setdefault("load_best_model_at_end", options["eval_strategy"] != "no"
+                       and options["eval_strategy"] == options["save_strategy"])
+    if options["max_steps"] == 0 or options["num_train_epochs"] <= 0:
+        raise ValueError("Use positive epochs and max_steps=-1 or a positive optimizer-step limit.")
+    for field in ("per_device_train_batch_size", "per_device_eval_batch_size", "gradient_accumulation_steps"):
+        if not isinstance(options[field], int) or options[field] < 1:
+            raise ValueError(f"{field} must be a positive integer.")
+    args = TrainingArguments(**options)
+    if "warmup_steps" not in settings:
+        effective_batch = args.per_device_train_batch_size * args.gradient_accumulation_steps * args.world_size
+        total_steps = args.max_steps if args.max_steps > 0 else math.ceil(math.ceil(train_examples/effective_batch) * args.num_train_epochs)
+        args.warmup_steps = math.ceil(total_steps * warmup_ratio)
+    return args
 
 
 def train_pilot(model, processor, manifest, data_root, output_dir, model_key, training, use_4bit=True):
@@ -498,14 +628,17 @@ def train_pilot(model, processor, manifest, data_root, output_dir, model_key, tr
     output_dir = Path(output_dir)
     train_rows = [r for r in manifest["examples"] if r["split"] == "train"]
     val_rows = [r for r in manifest["examples"] if r["split"] == "validation"]
-    args = training_arguments(output_dir, training, manifest["settings"]["seed"], len(train_rows))
+    args = training_arguments(output_dir, training, manifest["settings"]["seed"], len(train_rows),
+                              use_cpu=getattr(model, "_capstone_loading", {}).get("device") == "cpu")
     # A new run directory protects previous adapters and measurements.
     output_dir.mkdir(parents=True, exist_ok=False)
-    set_seed(manifest["settings"]["seed"])
-    eval_rows = evaluation_rows(manifest, "validation", training["eval_examples"])
+    set_seed(args.seed)
+    eval_rows = evaluation_rows(manifest, "validation", training.get("eval_examples"))
     metadata = {"model": MODELS[model_key], "model_key": model_key, "run_name": output_dir.name,
                 "dataset_fingerprint": manifest["fingerprint"],
                 "task": manifest["task"], "training": training, "use_4bit": use_4bit,
+                "resolved_training_arguments": args.to_dict(),
+                "loading": getattr(model, "_capstone_loading", {}),
                 "lora": model.peft_config["default"].to_dict(), "complete": False,
                 "versions": {p: importlib.metadata.version(p) for p in ("torch", "transformers", "peft", "accelerate")}}
     metadata["helper_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -518,31 +651,38 @@ def train_pilot(model, processor, manifest, data_root, output_dir, model_key, tr
     max_side = manifest["settings"]["image_max_side"]
     trainer = Trainer(model=model, args=args, train_dataset=train_rows, eval_dataset=val_rows,
                       data_collator=RegionCollator(processor, data_root, max_side))
-    before = predict_rows(model, processor, eval_rows, data_root, max_side, disable_adapter=True)
+    before = predict_rows(model, processor, eval_rows, data_root, max_side, disable_adapter=True,
+                          generation=training.get("generation"))
     save_json(output_dir / "pretrained_validation.json", {"metrics": classification_metrics(before), "predictions": before})
-    torch.cuda.reset_peak_memory_stats()
+    if not args.use_cpu and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer.train()
     # Save the small adapter and processor. The original weights stay untouched.
     adapter_dir = output_dir / "adapter"
     model.save_pretrained(adapter_dir, safe_serialization=True)
     processor.save_pretrained(adapter_dir)
-    after = predict_rows(model, processor, eval_rows, data_root, max_side)
+    after = predict_rows(model, processor, eval_rows, data_root, max_side, generation=training.get("generation"))
     save_json(output_dir / "adapted_validation.json", {"metrics": classification_metrics(after), "predictions": after})
     metadata.update(complete=True, optimizer_steps=trainer.state.global_step,
                     best_checkpoint=relative_best_checkpoint(output_dir, trainer.state.best_model_checkpoint),
-                    peak_allocated_gib=torch.cuda.max_memory_allocated() / 1024**3)
+                    peak_allocated_gib=torch.cuda.max_memory_allocated() / 1024**3 if not args.use_cpu and torch.cuda.is_available() else 0.0)
     save_json(output_dir / "run.json", metadata)
     return {"adapter_dir": str(adapter_dir), "pretrained": classification_metrics(before), "adapted": classification_metrics(after)}
 
 
-def reload_adapter(project_root, run_dir, *, model_key=None, task=None, dataset_fingerprint=None):
+def reload_adapter(project_root, run_dir, *, model_key=None, task=None, dataset_fingerprint=None,
+                   loading=None, use_4bit=None):
     run_dir = Path(run_dir)
     record = read_run_record(run_dir, model_key=model_key, task=task, dataset_fingerprint=dataset_fingerprint)
     from peft import PeftModel
     from transformers import AutoProcessor
-    base, _ = load_local_base(project_root, record["model_key"], record["use_4bit"])
+    loading_options = {**record.get("loading", {}), **(loading or {})}
+    base, _ = load_local_base(project_root, record["model_key"],
+                              record["use_4bit"] if use_4bit is None else use_4bit,
+                              loading=loading_options)
     model = PeftModel.from_pretrained(base, run_dir / "adapter", is_trainable=False, local_files_only=True)
     processor = AutoProcessor.from_pretrained(run_dir / "adapter", local_files_only=True, trust_remote_code=False)
+    _configure_image_processor(processor, record["model_key"], loading_options, defaults=False)
     model.eval()
     return model, processor, record
 
@@ -617,7 +757,8 @@ def relation_image(row, data_root, max_side=512):
     with Image.open(_dataset_file(data_root, row["rgb"])) as im:
         original_size = im.size
         image = im.convert("RGB")
-    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    if max_side is not None:
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     sx, sy = image.width / original_size[0], image.height / original_size[1]
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default(size=16)
@@ -639,7 +780,7 @@ def relation_messages(row, data_root, max_side=512):
     ]}]
 
 
-def prepare_relation_dataset(project_root, dataset_dir, source_manifest=None, settings=None):
+def prepare_relation_dataset(project_root, dataset_dir, source_manifest=None, settings=None, data_root=None):
     """Prepare reviewable pairs, NEVER infer GT relationships from class masks.
 
     This initial dataset uses semantic-region proposals from notebook 1. It is
@@ -650,8 +791,10 @@ def prepare_relation_dataset(project_root, dataset_dir, source_manifest=None, se
     from itertools import combinations
     project_root, dataset_dir = Path(project_root), Path(dataset_dir)
     cfg = {**RELATION_DATA_DEFAULTS, **(settings or {})}
-    if cfg["pairs_per_scene"] < 1 or cfg["image_max_side"] < 64:
-        raise ValueError("Use positive pairs_per_scene and image_max_side >= 64.")
+    if cfg["pairs_per_scene"] is not None and cfg["pairs_per_scene"] < 1:
+        raise ValueError("Use positive pairs_per_scene, or None for all candidate pairs.")
+    if cfg["image_max_side"] is not None and cfg["image_max_side"] < 1:
+        raise ValueError("image_max_side must be positive, or None to keep the original size.")
     if source_manifest is None:
         choices = sorted((project_root / "dataset/_training/osma_regions").glob("*/manifest.json"))
         if len(choices) != 1:
@@ -670,7 +813,7 @@ def prepare_relation_dataset(project_root, dataset_dir, source_manifest=None, se
         return relation_dataset_summary(dataset_dir)
     if dataset_dir.exists() and any(dataset_dir.iterdir()):
         raise ValueError("Partial dataset directory found. Choose a new DATASET_NAME; no files were overwritten.")
-    data_root = project_root / "dataset/osma-bench/data"
+    data_root = Path(data_root) if data_root is not None else project_root / "dataset/osma-bench/data"
     by_scene_frame = defaultdict(list)
     for row in source["examples"]:
         by_scene_frame[(row["scene"], row["frame"])].append(row)
@@ -892,10 +1035,9 @@ class RelationCollator:
         self.processor, self.data_root, self.max_side = processor, data_root, max_side
 
     def __call__(self, examples):
-        if len(examples) != 1:
-            raise ValueError("Use microbatch 1 and gradient accumulation for this collator.")
-        row = examples[0]
-        return encode_messages(self.processor, relation_messages(row, self.data_root, self.max_side), row["target"])
+        return encode_message_batch(self.processor,
+            [relation_messages(row, self.data_root, self.max_side) for row in examples],
+            [row["target"] for row in examples])
 
 
 def relation_metrics(predictions):
@@ -929,7 +1071,7 @@ def relation_metrics(predictions):
             "positive_relations_evaluated": len(positives), "per_relation": per_class}
 
 
-def predict_relations(model, processor, rows, data_root, max_side=512, disable_adapter=False):
+def predict_relations(model, processor, rows, data_root, max_side=512, disable_adapter=False, generation=None):
     import torch
     was_training = model.training
     model.eval()
@@ -939,7 +1081,7 @@ def predict_relations(model, processor, rows, data_root, max_side=512, disable_a
         with context, torch.inference_mode():
             for row in rows:
                 batch = encode_messages(processor, relation_messages(row, data_root, max_side)).to(model.device)
-                generated = model.generate(**batch, max_new_tokens=16, do_sample=False)
+                generated = model.generate(**batch, **{"max_new_tokens": 16, "do_sample": False, **(generation or {})})
                 raw = processor.batch_decode(generated[:, batch["input_ids"].shape[1]:], skip_special_tokens=True)[0]
                 # Keep a strict label contract. Wrong direction and verbose/invalid
                 # answers remain errors; never convert a failed answer into none.
@@ -958,32 +1100,36 @@ def _relation_fit(model, processor, manifest, data_root, output_dir, args, recor
     max_side = manifest["settings"]["image_max_side"]
     train = [r for r in manifest["examples"] if r["split"] == "train"]
     validation = evaluation_rows(manifest, "validation", limit=None)
+    prediction_rows = evaluation_rows(manifest, "validation", limit=record.get("training", {}).get("eval_examples"))
+    generation = record.get("training", {}).get("generation")
     trainer = Trainer(model=model, args=args, train_dataset=train, eval_dataset=validation,
                       data_collator=RelationCollator(processor, data_root, max_side))
     record["stage"] = "pretrained_validation"
     save_json(output_dir / "run.json", record)
-    before = predict_relations(model, processor, validation, data_root, max_side, disable_adapter=True)
+    before = predict_relations(model, processor, prediction_rows, data_root, max_side, disable_adapter=True,
+                               generation=generation)
     save_json(output_dir / "pretrained_validation.json", {"metrics": relation_metrics(before), "predictions": before})
     record["stage"] = "training"
     save_json(output_dir / "run.json", record)
-    torch.cuda.reset_peak_memory_stats()
+    if not args.use_cpu and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer.train()
     record["stage"] = "saving_adapter"
     save_json(output_dir / "run.json", record)
     model.save_pretrained(output_dir / "adapter", safe_serialization=True)
     processor.save_pretrained(output_dir / "adapter")
-    after = predict_relations(model, processor, validation, data_root, max_side)
+    after = predict_relations(model, processor, prediction_rows, data_root, max_side, generation=generation)
     save_json(output_dir / "adapted_validation.json", {"metrics": relation_metrics(after), "predictions": after})
     record.update(complete=True, stage="complete", optimizer_steps=trainer.state.global_step,
                   best_checkpoint=relative_best_checkpoint(output_dir, trainer.state.best_model_checkpoint),
-                  peak_allocated_gib=torch.cuda.max_memory_allocated()/1024**3)
+                  peak_allocated_gib=torch.cuda.max_memory_allocated()/1024**3 if not args.use_cpu and torch.cuda.is_available() else 0.0)
     save_json(output_dir / "run.json", record)
     return {"pretrained": relation_metrics(before), "adapted": relation_metrics(after)}
 
 
 def run_relation_pipeline(project_root, dataset_dir, model_key="qwen", action="prepare", run_name="relations_3epochs",
                           training=None, lora=None, use_4bit=True, source_manifest=None, data_settings=None,
-                          test_run=None):
+                          test_run=None, data_root=None, loading=None, generation=None):
     """One action controls preparation, fresh training, or saved-adapter testing.
 
     No install/download calls. Models exist only inside this call and are freed
@@ -993,10 +1139,10 @@ def run_relation_pipeline(project_root, dataset_dir, model_key="qwen", action="p
     project_root, dataset_dir = Path(project_root), Path(dataset_dir)
     if action not in ("prepare", "train", "test") or model_key not in MODELS:
         raise ValueError("ACTION must be prepare/train/test; MODEL_KEY must be qwen/smolvlm.")
+    data_root = Path(data_root) if data_root is not None else project_root / "dataset/osma-bench/data"
     if action == "prepare":
-        return prepare_relation_dataset(project_root, dataset_dir, source_manifest, data_settings)
+        return prepare_relation_dataset(project_root, dataset_dir, source_manifest, data_settings, data_root=data_root)
     requested_run = artifact_run_directory(project_root, "relationships", model_key, run_name)
-    data_root = project_root / "dataset/osma-bench/data"
     manifest = load_relation_manifest(dataset_dir, data_root)  # Fails before GPU loading if labels are missing.
     if data_settings is not None and manifest["settings"] != {**RELATION_DATA_DEFAULTS, **data_settings}:
         raise ValueError("DATA_SETTINGS differ from this prepared dataset. Restore them or prepare a new DATASET_NAME.")
@@ -1018,20 +1164,24 @@ def run_relation_pipeline(project_root, dataset_dir, model_key="qwen", action="p
             output_dir = Path(test_run)
         record = read_run_record(output_dir, model_key=model_key, task=manifest["task"],
                                  dataset_fingerprint=manifest["fingerprint"])
-        cached = output_dir / "held_out_test.json"
+        inference_settings = {"loading": loading or {}, "generation": generation or {}, "use_4bit": use_4bit}
+        # Changing inference options must not silently return old predictions.
+        # Keep historical default caches and write explicit configurations separately.
+        configured_inference = loading is not None or generation is not None or use_4bit != record.get("use_4bit", True)
+        cache_name = f"held_out_test_{fingerprint(inference_settings)[:12]}.json" if configured_inference else "held_out_test.json"
+        cached = output_dir / cache_name
         if cached.exists():
             result = json.loads(cached.read_text(encoding="utf-8"))
             if result.get("dataset_fingerprint") != manifest["fingerprint"]:
                 raise ValueError("Cached test belongs to a different dataset.")
             return {"action": action, "run_dir": str(output_dir), "metrics": result["metrics"], "cached": True}
     else:
-        cfg = {"max_steps": -1, "epochs": 3, "accumulation": 4, "learning_rate": 1e-4, "eval_steps": 10,
-               **(training or {})}
+        cfg = dict(training or {})
+        if (loading or {}).get("device") == "cpu":
+            cfg.setdefault("use_cpu", True)
+        if generation is not None:
+            cfg["generation"] = dict(generation)
         lora = {"rank": 8, "alpha": 16, "dropout": 0.05, **(lora or {})}
-        if cfg["accumulation"] < 1 or cfg["epochs"] <= 0 or cfg["max_steps"] == 0 or cfg["eval_steps"] < 1:
-            raise ValueError("Invalid training budget; use max_steps=-1 for epochs or a positive step limit.")
-        if cfg["max_steps"] > 0:
-            cfg["eval_steps"] = min(cfg["eval_steps"], cfg["max_steps"])
         output_dir = available_run_directory(requested_run)
     # Heavy imports and CUDA allocation happen only after data/run validation.
     import torch
@@ -1039,28 +1189,26 @@ def run_relation_pipeline(project_root, dataset_dir, model_key="qwen", action="p
     try:
         if action == "test":
             print("Testing saved relationship adapter:", output_dir)
-            model, processor, record = reload_adapter(project_root, output_dir)
+            model, processor, record = reload_adapter(project_root, output_dir, loading=loading, use_4bit=use_4bit)
             rows = evaluation_rows(manifest, "test", limit=None)
             evaluations = {}
             for mode, disabled in (("pretrained", True), ("adapted", False)):
                 predictions = predict_relations(model, processor, rows, data_root,
-                                                 manifest["settings"]["image_max_side"], disabled)
+                                                 manifest["settings"]["image_max_side"], disabled, generation=generation)
                 evaluations[mode] = {"metrics": relation_metrics(predictions), "predictions": predictions}
             metrics = {k: v["metrics"] for k, v in evaluations.items()}
-            save_json(output_dir / "held_out_test.json", {"dataset_fingerprint": manifest["fingerprint"],
-                       "metrics": metrics, "evaluations": evaluations})
+            save_json(cached, {"dataset_fingerprint": manifest["fingerprint"],
+                       "inference_settings": inference_settings, "metrics": metrics, "evaluations": evaluations})
         else:
             args = training_arguments(output_dir, cfg, manifest["settings"]["seed"],
                                       sum(r["split"] == "train" for r in manifest["examples"]))
-            if cfg["max_steps"] < 0:
-                # Evaluate/save every epoch, including the final one.
-                from transformers.trainer_utils import IntervalStrategy, SaveStrategy
-                args.eval_strategy, args.save_strategy = IntervalStrategy.EPOCH, SaveStrategy.EPOCH
-            args.prediction_loss_only = True
+            if "prediction_loss_only" not in cfg:
+                args.prediction_loss_only = True
             output_dir.mkdir(parents=True, exist_ok=False)
             record = {"model": MODELS[model_key], "model_key": model_key, "run_name": run_name,
                       "dataset_fingerprint": manifest["fingerprint"], "task": manifest["task"],
-                      "use_4bit": use_4bit, "training": cfg, "lora": lora, "complete": False, "stage": "loading_model",
+                      "use_4bit": use_4bit, "training": cfg, "lora": lora, "loading": loading or {},
+                      "resolved_training_arguments": args.to_dict(), "complete": False, "stage": "loading_model",
                       "helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                       "versions": {p: importlib.metadata.version(p) for p in
                                    ("torch", "transformers", "peft", "accelerate")}}
@@ -1070,7 +1218,9 @@ def run_relation_pipeline(project_root, dataset_dir, model_key="qwen", action="p
             save_json(output_dir / "data_manifest.json", manifest)
             print("Training fresh relationship adapter:", output_dir)
             model, processor, _, _ = load_trainable(project_root, model_key, **lora, use_4bit=use_4bit,
-                                                    seed=manifest["settings"]["seed"])
+                                                    seed=args.seed, loading=loading,
+                                                    gradient_checkpointing=args.gradient_checkpointing,
+                                                    gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
             metrics = _relation_fit(model, processor, manifest, data_root, output_dir, args, record)
             print("Saved relationship adapter:", output_dir / "adapter")
         return {"action": action, "run_dir": str(output_dir), "metrics": metrics, "cached": False}
