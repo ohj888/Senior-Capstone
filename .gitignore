@@ -14,3 +14,4 @@ dataset/
 
 # Local LoRA runs/checkpoints are reproducible outputs, not source files.
 /artifacts/
+scene_graphs/
