@@ -173,10 +173,9 @@ def semantic_metrics(gt, predicted, class_ids):
 
 
 def map_names(names, classes, aliases):
+    from .object_choices import effective_aliases
     vocabulary = {normalize(name): int(key) for key, name in classes.items()}
-    alias_lookup = {normalize(k): normalize(v) for k, v in aliases.items()}
-    if any(v not in vocabulary for v in alias_lookup.values()):
-        raise ValueError("Every alias target must be an exact dataset class name")
+    alias_lookup = effective_aliases(classes, aliases)
     mapped, unresolved = {}, []
     for object_id, name in names.items():
         label = alias_lookup.get(normalize(name), normalize(name))
@@ -184,6 +183,65 @@ def map_names(names, classes, aliases):
         if mapped[int(object_id)] == -1:
             unresolved.append({"object_id": int(object_id), "prediction": name})
     return mapped, unresolved
+
+
+def prediction_contract(folder, classes):
+    """Reject malformed predictions before scoring a run claiming strict labels."""
+    from . import object_choices as oc, relation_choices as rc
+    cfg = read_json(folder / "run.json").get("settings", {})
+    object_format = cfg.get("object_response_format", "legacy")
+    relation_format = cfg.get("relationship_response_format", "legacy")
+    object_views = relation_views = 0
+    if object_format == oc.FORMAT:
+        expected = hashlib.sha256(json.dumps(classes, sort_keys=True).encode("utf-8")).hexdigest()
+        if cfg.get("object_vocabulary_sha256") != expected:
+            raise ValueError("Object vocabulary differs from scoring vocabulary; rebuild graph")
+        allowed = set(cfg["object_choices"])
+        class_by_name = {name: key for key, name in classes.items()}
+        for node in read_json(folder / "local_node_predictions.json"):
+            if node["tag"] not in allowed | {"invalid"}:
+                raise ValueError("Noncanonical voted object label in strict run")
+            for view in node["predictions"]:
+                label = view["prediction"]
+                expected_id = -1 if label == oc.ABSTAIN else class_by_name.get(label)
+                if (label not in allowed or not view.get("contract_valid")
+                        or view.get("raw_prediction") != label or view.get("class_id") != expected_id
+                        or view.get("vocabulary_sha256") != expected):
+                    raise ValueError("Object prediction violates its saved label/class-ID contract")
+                object_views += 1
+    if relation_format in rc.AUDITED_FORMATS:
+        for pair in read_json(folder / "local_relation_predictions.json"):
+            for view in pair["predictions"]:
+                if (view["prediction"] not in rc.LABELS or not view.get("contract_valid")
+                        or view.get("raw_prediction") != view["prediction"]
+                        or view.get("choice_decoding") != cfg["relationship_choice_decoding"]):
+                    raise ValueError("Relationship prediction violates its saved label contract")
+                checked = [view]
+                if cfg.get("verify_swapped_boxes"):
+                    swapped = view.get("swapped_prediction", {})
+                    if (swapped.get("prediction") not in rc.LABELS or not swapped.get("contract_valid")
+                            or swapped.get("choice_decoding") != cfg["relationship_choice_decoding"]
+                            or view.get("swap_consistent") != (swapped["prediction"] == rc.SWAPPED_LABELS[view["prediction"]])):
+                        raise ValueError("Missing or inconsistent A/B swap audit")
+                    checked.append(swapped)
+                for prediction in checked:
+                    if cfg["relationship_choice_decoding"] == "sequence_score":
+                        scores = prediction.get("choice_scores", [])
+                        if (len(scores) != len(rc.LABELS) or {r["label"] for r in scores} != set(rc.LABELS)
+                                or any(not np.isfinite(r["mean_log_probability"]) for r in scores)
+                                or max(scores, key=lambda r: r["mean_log_probability"])["label"] != prediction["prediction"]):
+                            raise ValueError("Complete-label scores disagree with the selected relationship")
+                    relation_views += 1
+    condition = {key: cfg.get(key) for key in (
+        "object_response_format", "object_vocabulary_sha256", "object_prompt",
+        "relationship_response_format", "relationship_choice_decoding", "relationship_protocol", "relation_prompt",
+        "observation_selection_policy", "verify_swapped_boxes", "edge_validation")}
+    return {"object_format": object_format, "relationship_format": relation_format,
+            "relationship_decoder": cfg.get("relationship_choice_decoding", "legacy"),
+            "swap_check_enabled": cfg.get("verify_swapped_boxes", False),
+            "edge_policy": cfg.get("edge_validation", {}).get("policy", "unchecked"),
+            "verified_object_views": object_views, "verified_relationship_views": relation_views,
+            "comparison_signature": hashlib.sha256(json.dumps(condition, sort_keys=True).encode("utf-8")).hexdigest()}
 
 
 def completed_runs(scene_dir, mapfile):
@@ -269,12 +327,23 @@ def graph_diagnostics(folder, object_count):
     pairs = read_json(folder / "local_relation_predictions.json")
     views = sum(p["votes"]["views"] for p in pairs)
     times = [v["generation_seconds"] for p in pairs for v in p["predictions"]]
+    object_views = [view for node in nodes for view in node["predictions"]]
+    checked_objects = [view for view in object_views if "contract_valid" in view]
     return {"variant": graph["variant"], "folder": folder.name, "mapped_objects": object_count,
             "retained_nodes": len(graph["nodes"]), "node_retention": len(graph["nodes"]) / object_count,
             "predicted_edges": len(graph["edges"]), "candidate_pairs": len(pairs),
+            "flagged_saved_edges": sum(edge.get("edge_validation", {}).get("accepted") is False for edge in graph["edges"]),
+            "strict_check_passing_edges": sum(edge.get("edge_validation", {}).get("accepted") is True
+                                             and edge["edge_validation"].get("status") != "unchecked" for edge in graph["edges"]),
             "unresolved_pairs": len(graph["unresolved_pairs"]),
             "resolved_pair_rate": (len(pairs)-len(graph["unresolved_pairs"])) / len(pairs) if pairs else None,
             "invalid_relation_output_rate": sum(p["votes"]["invalid"] for p in pairs) / views if views else None,
+            "object_contract_checked_views": len(checked_objects),
+            "object_contract_violation_rate": sum(not view["contract_valid"] for view in checked_objects) / len(checked_objects) if checked_objects else None,
+            "object_abstained_views": sum(view.get("abstained", False) for view in object_views),
+            "edge_check_rejected_pairs": sum(p.get("reason") == "edge_validation_rejected" for p in pairs),
+            "swap_inconsistent_views": sum(view.get("swap_consistent") is False for pair in pairs for view in pair["predictions"]),
+            "unchecked_saved_edges": sum("edge_validation" not in edge or edge["edge_validation"].get("status") == "unchecked" for edge in graph["edges"]),
             "tied_relation_pairs": sum(p["votes"]["tied"] for p in pairs),
             "median_relation_generation_s": float(np.median(times)) if times else None,
             "mean_object_vote_agreement": float(np.mean([n["votes"]["agreement"] for n in nodes if n["votes"]["agreement"] is not None]))}
@@ -298,7 +367,10 @@ def pair_case_gallery(output, runs, data_root, max_cases=8):
             reference = review.get("reviewed_relation", "").strip()
             normalize_relation = lambda r: normalize(r).replace("none of these", "none")
             status = ("reviewed success" if normalize_relation(reference) == normalize_relation(decision) else "reviewed failure") if reference else (
-                "unresolved pipeline case" if decision == "FAIL" else "candidate success: review required")
+                "rejected by edge checks" if pair.get("reason") == "edge_validation_rejected" else
+                "unresolved pipeline case" if decision == "FAIL" else
+                "flagged prediction: review required" if pair.get("edge_validation", {}).get("accepted") is False else
+                "unverified prediction: review required")
             views = pair["predictions"][:2]
             fig, axes = plt.subplots(1, max(1, len(views)), figsize=(12, 4), squeeze=False)
             if not views:
@@ -317,6 +389,8 @@ def pair_case_gallery(output, runs, data_root, max_cases=8):
             fig.tight_layout(); fig.savefig(cases_dir / filename, dpi=140); plt.close(fig)
             cards.append({"variant": variant, "source_original_id": pair["source_original_id"],
                           "target_original_id": pair["target_original_id"], "prediction": decision,
+                          "proposed_relation": pair.get("proposed_relation", pair["relation"]),
+                          "edge_check": pair.get("edge_validation", {}).get("reason", "not_checked"),
                           "reviewed_relation": reference, "status": status, "reason": pair["reason"],
                           "image": "cases/" + filename})
     write_csv(Path(output) / "qualitative_cases.csv", cards)
@@ -343,7 +417,8 @@ def build_report(project_root, experiment, scene, output, *, pixel_stride=4, vox
         raise FileNotFoundError("Run this evaluator inside the mapping runtime so its saved paths resolve")
     data_root = project_root / "dataset/osma-bench/data"
     classes = {int(c["id"]): c["name"] for c in read_json(data_root / scene / "embed_semseg_classes.json")["classes"]}
-    aliases = aliases or {}
+    from .object_choices import effective_aliases
+    aliases = effective_aliases(classes, aliases)
     excluded_ids = {k for k, v in classes.items() if normalize(v) in set(map(normalize, excluded))}
     class_ids = sorted(set(classes) - excluded_ids)
     print("Reconstructing observed reference from", len(manifest["frames"]), "saved frames...", flush=True)
@@ -356,6 +431,9 @@ def build_report(project_root, experiment, scene, output, *, pixel_stride=4, vox
     runs, status = completed_runs(scene_dir, mapfile)
     write_csv(output / "run_status.csv", status)
     if not runs: raise ValueError("No completed graph variants yet; rerun the report after a graph finishes")
+    contracts = [{"variant": name, **prediction_contract(folder, classes)} for name, folder in runs.items()]
+    if len({row["comparison_signature"] for row in contracts}) != 1:
+        raise ValueError("Variants use different prompts/decoders/edge checks. Complete all variants under the same settings before comparing them.")
     print("Reference voxels:", len(reference["xyz"]), "foreground:", len(foreground["xyz"]),
           "predicted:", len(prediction["xyz"]), flush=True)
     np.savez_compressed(output / "observed_gt.npz", **reference)
@@ -415,12 +493,14 @@ def build_report(project_root, experiment, scene, output, *, pixel_stride=4, vox
                      "pixel_stride": pixel_stride, "voxel_size_m": voxel_size, "max_depth_m": max_depth_m,
                      "geometry_thresholds_m": list(thresholds), "semantic_association_threshold_m": semantic_threshold,
                      "excluded_classes": list(excluded), "class_ids": class_ids, "label_aliases": aliases,
+                     "category_matching_protocol": "exact dataset names plus explicit spelling aliases; no broad/fine category merging",
                      "mapfile": str(mapfile), "map_bytes": mapfile.stat().st_size,
                      "map_mtime_ns": mapfile.stat().st_mtime_ns, "mapping_fingerprint": manifest["settings_fingerprint"],
                      "coordinate_frame": "source world; staged camera-to-world OpenCV poses; no fitted registration",
                      "reference_kind": "observed semantic RGB-D reference, not full-room mesh or instance graph",
                      "protocol": "GT-reference foreground voxels; missing/unknown predictions count as errors; mAcc/mIoU average GT-supported classes; Chamfer is sum of unsquared directional means",
-                     "sources": sources, "report_helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+                     "sources": sources, "inference_contracts": contracts,
+                     "report_helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     save_json(output / "report.json", configuration)
     print("Report saved:", output, flush=True)
     return output

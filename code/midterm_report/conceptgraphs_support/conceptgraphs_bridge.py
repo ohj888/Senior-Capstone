@@ -449,6 +449,7 @@ def load_map_objects(path, manifest):
     Pickle is the upstream on-disk format and must only come from local runs.
     No Open3D is needed here; the saved arrays already contain the geometry.
     """
+    from .observation_selection import select_observations, POLICY
     with gzip.open(path, "rb") as handle:
         saved = pickle.load(handle)
     objects = saved["objects"] if isinstance(saved, dict) else saved
@@ -492,12 +493,14 @@ def load_map_objects(path, manifest):
         names = [str(value) for value in obj.get("class_name", [])]
         converted.append({"id": str(index), "center": ((minimum + maximum) / 2).tolist(),
                           "extent": (maximum - minimum).tolist(), "bbox_min": minimum.tolist(), "bbox_max": maximum.tolist(),
-                          "bbox_corners": bounds.tolist(), "observations": observations,
+                          "bbox_corners": bounds.tolist(), "observations": select_observations(observations),
+                          "raw_observation_count": len(observations),
                           "detection_class": Counter(names).most_common(1)[0][0] if names else None,
                           "point_count": len(obj.get("pcd_np", [])), "num_detections": int(obj.get("num_detections", len(observations)))})
     return {"scene": manifest["scene"], "objects": converted, "metadata": {"scene": manifest["scene"], "map_path": str(Path(path).resolve()),
             "settings_fingerprint": manifest["settings_fingerprint"], "coordinate_frame": manifest["coordinate_frame"],
-            "bbox_representation": "axis-aligned bounds of original oriented bbox corners", "uses_semantic_ground_truth": False}}
+            "bbox_representation": "axis-aligned bounds of original oriented bbox corners",
+            "observation_selection": POLICY, "uses_semantic_ground_truth": False}}
 
 
 def original_candidate_pairs(path, distance_threshold=None, overlap_threshold=0.01):

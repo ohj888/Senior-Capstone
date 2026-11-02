@@ -1,7 +1,8 @@
 """Local VLM scene-graph pilot on a fixed, genuine ConceptGraphs object map.
 
 Mapping is delegated to the sibling conceptgraphs_bridge module. This module never uses semantic
-masks, category annotations, or VQA answers as inference inputs. Diagnostics
+masks, per-object category annotations, or VQA answers as inference inputs. A
+closed-set naming run may use the declared category vocabulary. Diagnostics
 measure consistency and coverage, not ground-truth graph accuracy.
 """
 from collections import Counter
@@ -322,21 +323,35 @@ class LocalPredictor:
         self.model.eval()
         return self
 
-    def predict(self, image, prompt, *, choices=None):
+    def predict(self, image, prompt, *, choices=None, choice_decoding="constrained_greedy"):
         import torch
         messages = [{"role": "user", "content": [{"type": "image", "image": image},
                                                     {"type": "text", "text": prompt}]}]
         batch = lb.encode_messages(self.processor, messages).to(self.model.device)
         generation = dict(self.generation)
+        eos_ids = None
         if choices is not None:
+            if not choices or len(set(choices)) != len(choices):
+                raise ValueError("Strict label choices must be nonempty and unique")
             from .relation_choices import LabelTokenConstraint
             tokenizer = self.processor.tokenizer
             eos_ids = generation.get("eos_token_id", self.model.generation_config.eos_token_id)
             if eos_ids is None:
                 eos_ids = tokenizer.eos_token_id
-            generation["prefix_allowed_tokens_fn"] = LabelTokenConstraint(
-                tokenizer, choices, int(batch["input_ids"].shape[1]), eos_ids,
-                generation.get("max_new_tokens", 24))
+            if eos_ids is None:
+                raise ValueError("Strict label decoding requires an EOS token")
+            if choice_decoding not in ("constrained_greedy", "sequence_score"):
+                raise ValueError("Unknown choice decoding method")
+            if choice_decoding == "constrained_greedy":
+                generation["prefix_allowed_tokens_fn"] = LabelTokenConstraint(
+                    tokenizer, choices, int(batch["input_ids"].shape[1]), eos_ids,
+                    generation.get("max_new_tokens", 24))
+            # Prevent inherited sampling/penalties from conflicting with the label grammar.
+            generation.update(do_sample=False, num_beams=1, num_return_sequences=1,
+                              min_new_tokens=0, min_length=0, repetition_penalty=1.0,
+                              no_repeat_ngram_size=0, forced_bos_token_id=None,
+                              forced_eos_token_id=None, bad_words_ids=None,
+                              suppress_tokens=None, begin_suppress_tokens=None)
             generation["renormalize_logits"] = True
         disabled = self.disabled and hasattr(self.model, "disable_adapter")
         context = self.model.disable_adapter() if disabled else nullcontext()
@@ -344,13 +359,91 @@ class LocalPredictor:
             torch.cuda.synchronize(self.model.device)
         started = time.perf_counter()
         with context, torch.inference_mode():
-            generated = self.model.generate(**batch, **generation)
+            if choices is not None and choice_decoding == "sequence_score":
+                answer, score_details = self._score_labels(batch, messages, choices, eos_ids)
+                generated = None
+            else:
+                generated = self.model.generate(**batch, **generation)
         if self.model.device.type == "cuda":
             torch.cuda.synchronize(self.model.device)
-        answer = self.processor.batch_decode(generated[:, batch["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-        return {"prediction": answer, "generation_seconds": time.perf_counter()-started,
-                "input_tokens": int(batch["input_ids"].shape[1]),
-                "output_tokens": int(generated.shape[1]-batch["input_ids"].shape[1])}
+        result = {"generation_seconds": time.perf_counter()-started,
+                  "input_tokens": int(batch["input_ids"].shape[1])}
+        if generated is not None:
+            suffix = generated[:, batch["input_ids"].shape[1]:]
+            answer = self.processor.batch_decode(suffix, skip_special_tokens=True,
+                                                 clean_up_tokenization_spaces=False)[0]
+            result["output_tokens"] = int(suffix.shape[1])
+            if choices is not None:
+                terminators = eos_ids if isinstance(eos_ids, (tuple, list)) else [eos_ids]
+                if not any(int(token) in terminators for token in suffix[0]):
+                    raise ValueError("Constrained label was truncated before EOS")
+        else:
+            result.update(score_details)
+        if choices is not None:
+            if answer not in choices:
+                raise ValueError(f"Decoder returned a noncanonical label: {answer!r}")
+            result.update(choice_decoding=choice_decoding, contract_valid=True)
+        return {"prediction": answer, **result}
+
+    def _score_labels(self, batch, messages, choices, eos_ids):
+        """Compare complete continuations, avoiding greedy shared-prefix decisions.
+
+        Evaluate one candidate at a time to avoid multiplying image/activation
+        memory. Scores are mean conditional token log probabilities including
+        EOS, not calibrated probabilities or correctness confidence.
+        """
+        import torch
+        terminators = list(eos_ids) if isinstance(eos_ids, (tuple, list)) else [eos_ids]
+        prefix = int(batch["input_ids"].shape[1])
+        scores = []
+        for label in choices:
+            # Use the same complete assistant template as training. Never guess
+            # how an isolated label's tokens join the multimodal prompt or which
+            # of several EOS IDs actually closes this model's assistant turn.
+            candidate = lb.encode_messages(self.processor, messages, target=label)
+            candidate.pop("labels")
+            suffix = candidate["input_ids"][0, prefix:].tolist()
+            end = next((i for i, token in enumerate(suffix) if token in terminators), None)
+            if end is None:
+                raise ValueError("Assistant template has no recognized EOS after label")
+            decoded = self.processor.tokenizer.decode(suffix[:end], skip_special_tokens=True,
+                                                       clean_up_tokenization_spaces=False)
+            # SmolVLM's generation prefix ends at 'Assistant:', while a full
+            # assistant turn inserts a space before its content. This boundary
+            # whitespace is template formatting, not part of the category.
+            # Allow only outer ASCII whitespace; never repair words/direction.
+            if decoded.strip(" \t\r\n") != label:
+                raise ValueError(f"Assistant template changed choice label: expected {label!r}, decoded {decoded!r}")
+            leading = decoded[:len(decoded)-len(decoded.lstrip(" \t\r\n"))]
+            trailing = decoded[len(decoded.rstrip(" \t\r\n")):]
+            stop = prefix + end + 1
+            for key in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"):
+                if key in candidate:
+                    candidate[key] = candidate[key][:, :stop]
+            candidate = candidate.to(self.model.device)
+            if not torch.equal(candidate["input_ids"][:, :prefix], batch["input_ids"]):
+                raise ValueError("Candidate scoring changed the image/prompt token prefix")
+            target = candidate["input_ids"][:, prefix:]
+            output = self.model(**candidate, use_cache=False, return_dict=True)
+            logits = output.logits[:, prefix-1:prefix+target.shape[1]-1, :].float()
+            if logits.shape[1] != target.shape[1]:
+                raise ValueError("Model did not return logits for every label token")
+            log_probs = logits.log_softmax(dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            score = float(log_probs.mean().item())
+            if not torch.isfinite(log_probs).all():
+                raise ValueError(f"Nonfinite likelihood for choice {label!r}")
+            scores.append({"label": label, "mean_log_probability": score,
+                           "sum_log_probability": float(log_probs.sum().item()),
+                           "assistant_boundary_whitespace": {"leading": leading, "trailing": trailing},
+                           "tokens_including_eos": int(target.shape[1])})
+            del output, logits, log_probs, candidate
+        ordered = sorted(scores, key=lambda row: -row["mean_log_probability"])
+        winner = ordered[0]
+        return winner["label"], {"choice_scores": scores,
+                "choice_score_rule": "mean_log_probability_including_eos_v1",
+                "choice_score_margin": winner["mean_log_probability"] - ordered[1]["mean_log_probability"]
+                    if len(ordered) > 1 else None,
+                "output_tokens": winner["tokens_including_eos"]}
 
     def __exit__(self, *exc):
         self.model = self.processor = None
@@ -419,7 +512,7 @@ def split_audit(evidence, variant, split="validation"):
 
 def run_variant(root, evidence, data_root, output_dir, variant, *, loading=None, generation=None,
                 predictor_factory=LocalPredictor, split="validation"):
-    """Run object naming, release GPU, then relation prediction; save raw evidence.
+    """Legacy frozen-evidence runner, not the notebook's upstream graph builder.
 
     output_dir must be fresh. Interrupted/failed runs remain marked incomplete.
     No training occurs here: saved adapters are loaded frozen for inference.
@@ -533,7 +626,7 @@ def compare_graphs(graphs):
 
 
 def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generation=None,
-                  relationship_response_format="multiple_choice_v1"):
+                  relationship_response_format=None):
     """Actual local generations on saved validation examples; no graph claim.
 
     This isolates model/processor/adapter loading from unavailable detector or
@@ -541,7 +634,8 @@ def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generat
     The same object and relation examples are used across all variants.
     """
     from . import relation_choices as rc
-    inference = rc.inference_settings({"relationship_response_format": relationship_response_format})
+    from . import object_choices as oc
+    inference = rc.inference_settings({"relationship_response_format": relationship_response_format or rc.FORMAT})
     if not variants:
         raise ValueError("Select at least one variant.")
     for variant in variants:
@@ -560,17 +654,22 @@ def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generat
             with LocalPredictor(root, variant, task, loading, generation) as predictor:
                 for row in rows:
                     if task == "objects":
-                        image, prompt = lb.load_crop(row, data_root), lb.PROMPT
+                        object_cfg = oc.inference_settings({}, data_root, row["scene"])
+                        image, prompt = lb.load_crop(row, data_root), object_cfg["object_prompt"]
+                        choices, method = object_cfg["object_choices"], "constrained_greedy"
                     else:
                         image = lb.relation_image(row, data_root)
                         prompt = inference.get("relation_prompt", lb.RELATION_PROMPT)
-                    choices = rc.LABELS if task == "relationships" and inference["relationship_response_format"] == rc.FORMAT else None
+                        choices = rc.LABELS if inference["relationship_response_format"] == rc.FORMAT else None
+                        method = inference.get("relationship_choice_decoding", "constrained_greedy")
                     results.append({"variant": variant["name"], "task": task, "id": row["id"],
                                     "scene": row["scene"], "target": row["target"],
-                                    **predictor.predict(image, prompt, choices=choices)})
+                                    **predictor.predict(image, prompt, choices=choices, choice_decoding=method)})
     return {"kind": "adapter_component_smoke", "not_a_scene_graph_benchmark": True,
             "generation": {**DEFAULT_GENERATION, **(generation or {})},
-            "relationship_response_format": inference["relationship_response_format"], "results": results}
+            "relationship_response_format": inference["relationship_response_format"],
+            "relationship_choice_decoding": inference.get("relationship_choice_decoding", "legacy"),
+            "object_response_format": oc.FORMAT, "results": results}
 
 
 def plot_graph(graph):
