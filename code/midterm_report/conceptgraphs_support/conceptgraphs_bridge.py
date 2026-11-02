@@ -8,8 +8,9 @@ The dependency checkout is never edited. See BridgeConfig for all pilot knobs.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 import gzip
 import hashlib
 import importlib.util
@@ -99,6 +100,39 @@ def _json(path, value):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def _run_logged(command, log_path, *, cwd=None, env=None):
+    """Forward child output to Jupyter and keep the traceback in a UTF-8 log."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    tail = deque(maxlen=60)
+    child_env = {**(os.environ if env is None else env),
+                 "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    print("Pipeline log:", log_path, flush=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        with subprocess.Popen(command, cwd=cwd, env=child_env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", errors="replace", bufsize=1) as process:
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                    log.flush()
+                    tail.append(line)
+                return_code = process.wait()
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+    if return_code:
+        raise RuntimeError(
+            f"ConceptGraphs process failed (exit {return_code}). Full log: {log_path}\n"
+            + "".join(tail))
 
 
 def _digest(value):
@@ -397,7 +431,8 @@ def run_stage(config, manifest, stage):
         if not report["ready"]:
             failures = [row["check"] + ": " + row["detail"] for row in report["checks"] if not row["ok"]]
             raise RuntimeError("Local ConceptGraphs dependencies are not ready:\n" + "\n".join(failures))
-    subprocess.run(commands[stage], check=True, cwd=settings["conceptgraphs_root"], env=_environment(settings))
+    log_path = Path(settings["run_dir"]) / "logs" / f"{stage}-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
+    _run_logged(commands[stage], log_path, cwd=settings["conceptgraphs_root"], env=_environment(settings))
     output = (Path(settings["run_dir"]).parent / "scene_graphs/comparison.json" if stage == "graph" else
               Path(settings["run_dir"]) / "canonical_map.json" if stage == "export" else
               map_path(config, manifest) if stage == "map" else
@@ -523,19 +558,43 @@ def _clip_features(image, detections, clip_model, preprocess, tokenizer, classes
     return crops, np.concatenate(images) if images else [], np.concatenate(texts) if texts else []
 
 
+class _DeferredClip:
+    """Load CLIP after RAM initialization has released its CPU checkpoint."""
+    def __init__(self, loader, device=None):
+        self.loader, self.device, self.components = loader, device, None
+
+    def to(self, device):
+        # Preserve an explicit CPU placement when upstream requests CUDA.
+        if self.device is None:
+            self.device = device
+        return self
+
+    def load(self):
+        if self.components is None:
+            print("Loading local CLIP after detector/tagger initialization...", flush=True)
+            model, _, preprocess = self.loader()
+            if self.device is not None:
+                model = model.to(self.device)
+            self.components = model, preprocess
+        return self.components
+
+
 def _detect(settings, manifest):
     """Run original detector main, replacing filesystem/model-loading defaults."""
     import importlib
     from contextlib import ExitStack
     from unittest.mock import patch
-    import matplotlib
-    import open_clip
-    import torch
+    from .conceptgraphs_clip_cache import ensure_clip_cache, load_clip_state_dict
     runtime, arguments = settings["detector_runtime"], settings["detector"]
     if arguments["class_set"] == "scene":
         raise ValueError("GT scene class lists are excluded from this baseline")
     if not runtime["clip_checkpoint"] or not Path(runtime["clip_checkpoint"]).is_file():
         raise FileNotFoundError("Supply detector_runtime.clip_checkpoint; downloads are disabled")
+    clip_cache = ensure_clip_cache(runtime["clip_checkpoint"])
+    import matplotlib
+    import open_clip
+    import open_clip.factory
+    import torch
     os.environ.update(_environment(settings))
     for path in (settings["conceptgraphs_root"], runtime["gsa_path"]):
         if path:
@@ -557,19 +616,25 @@ def _detect(settings, manifest):
         upstream.FOREGROUND_GENERIC_CLASSES = list(runtime["generic_classes"])
     original_clip = open_clip.create_model_and_transforms
     original_tokenizer = open_clip.get_tokenizer
+    original_clip_state_dict = open_clip.factory.load_state_dict
+    def local_clip_state_dict(checkpoint, *args, **kwargs):
+        if Path(checkpoint).resolve() == Path(runtime["clip_checkpoint"]).resolve():
+            return load_clip_state_dict(clip_cache)
+        return original_clip_state_dict(checkpoint, *args, **kwargs)
     def local_clip(*args, **kwargs):
-        model, train_prep, eval_prep = original_clip(runtime["clip_model"], pretrained=runtime["clip_checkpoint"], **kwargs)
-        if runtime["clip_device"] is not None:
-            # Upstream moves every model to args.device at once. Keep this
-            # independent placement option for small local GPUs.
-            original_to = model.to
-            model.to = lambda *a, **k: original_to(runtime["clip_device"])
-            model.to(runtime["clip_device"])
-        return model, train_prep, eval_prep
+        # ViT-H in CPU memory overlaps RAM's model/checkpoint allocations in
+        # upstream's loading order, exhausting small WSL VMs before inference.
+        model = _DeferredClip(lambda: original_clip(runtime["clip_model"],
+                              pretrained=runtime["clip_checkpoint"], **kwargs), runtime["clip_device"])
+        return model, None, None
     def local_tokenizer(*args, **kwargs):
         return original_tokenizer(runtime["clip_tokenizer_path"] or runtime["clip_model"], **kwargs)
-    upstream.compute_clip_features = lambda image, detections, model, prep, tok, classes, device: _clip_features(
-        image, detections, model, prep, tok, classes, runtime["clip_device"] or device, runtime["clip_crop_padding"])
+    def local_clip_features(image, detections, model, prep, tok, classes, device):
+        if isinstance(model, _DeferredClip):
+            model, prep = model.load()
+        return _clip_features(image, detections, model, prep, tok, classes,
+                              runtime["clip_device"] or device, runtime["clip_crop_padding"])
+    upstream.compute_clip_features = local_clip_features
     if arguments["sam_variant"] in {"mobilesam", "lighthqsam"}:
         def small_sam(variant, device):
             if variant == "mobilesam":
@@ -591,6 +656,7 @@ def _detect(settings, manifest):
     args.desired_width = settings["image_width"] or manifest["camera"]["image_width"]
     args.device = settings["device"]
     with ExitStack() as stack:
+        stack.enter_context(patch.object(open_clip.factory, "load_state_dict", side_effect=local_clip_state_dict))
         stack.enter_context(patch.object(open_clip, "create_model_and_transforms", side_effect=local_clip))
         stack.enter_context(patch.object(open_clip, "get_tokenizer", side_effect=local_tokenizer))
         if runtime["dino_text_encoder_path"]:
@@ -647,7 +713,8 @@ def run_local_pipeline(config, actions=("prepare", "detect", "map", "graph"), *,
         command = [settings["python_executable"], "-u", str(Path(__file__).resolve()),
                    "--stage", "pipeline", "--config", str(control), "--actions", *actions]
     _json(control, runtime)
-    subprocess.run(command, check=True)
+    log_path = control.parent / "logs" / f"pipeline-{datetime.now():%Y%m%d-%H%M%S-%f}.log"
+    _run_logged(command, log_path)
     return control
 
 

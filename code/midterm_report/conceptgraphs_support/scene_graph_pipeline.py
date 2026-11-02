@@ -322,18 +322,29 @@ class LocalPredictor:
         self.model.eval()
         return self
 
-    def predict(self, image, prompt):
+    def predict(self, image, prompt, *, choices=None):
         import torch
         messages = [{"role": "user", "content": [{"type": "image", "image": image},
                                                     {"type": "text", "text": prompt}]}]
         batch = lb.encode_messages(self.processor, messages).to(self.model.device)
+        generation = dict(self.generation)
+        if choices is not None:
+            from .relation_choices import LabelTokenConstraint
+            tokenizer = self.processor.tokenizer
+            eos_ids = generation.get("eos_token_id", self.model.generation_config.eos_token_id)
+            if eos_ids is None:
+                eos_ids = tokenizer.eos_token_id
+            generation["prefix_allowed_tokens_fn"] = LabelTokenConstraint(
+                tokenizer, choices, int(batch["input_ids"].shape[1]), eos_ids,
+                generation.get("max_new_tokens", 24))
+            generation["renormalize_logits"] = True
         disabled = self.disabled and hasattr(self.model, "disable_adapter")
         context = self.model.disable_adapter() if disabled else nullcontext()
         if self.model.device.type == "cuda":
             torch.cuda.synchronize(self.model.device)
         started = time.perf_counter()
         with context, torch.inference_mode():
-            generated = self.model.generate(**batch, **self.generation)
+            generated = self.model.generate(**batch, **generation)
         if self.model.device.type == "cuda":
             torch.cuda.synchronize(self.model.device)
         answer = self.processor.batch_decode(generated[:, batch["input_ids"].shape[1]:], skip_special_tokens=True)[0]
@@ -521,13 +532,16 @@ def compare_graphs(graphs):
              if not isinstance(value, (dict, list))}} for graph in graphs]
 
 
-def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generation=None):
+def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generation=None,
+                  relationship_response_format="multiple_choice_v1"):
     """Actual local generations on saved validation examples; no graph claim.
 
     This isolates model/processor/adapter loading from unavailable detector or
     mapping dependencies. Targets are retained only in returned audit records.
     The same object and relation examples are used across all variants.
     """
+    from . import relation_choices as rc
+    inference = rc.inference_settings({"relationship_response_format": relationship_response_format})
     if not variants:
         raise ValueError("Select at least one variant.")
     for variant in variants:
@@ -548,12 +562,15 @@ def adapter_smoke(root, data_root, variants, *, samples=1, loading=None, generat
                     if task == "objects":
                         image, prompt = lb.load_crop(row, data_root), lb.PROMPT
                     else:
-                        image, prompt = lb.relation_image(row, data_root), lb.RELATION_PROMPT
+                        image = lb.relation_image(row, data_root)
+                        prompt = inference.get("relation_prompt", lb.RELATION_PROMPT)
+                    choices = rc.LABELS if task == "relationships" and inference["relationship_response_format"] == rc.FORMAT else None
                     results.append({"variant": variant["name"], "task": task, "id": row["id"],
                                     "scene": row["scene"], "target": row["target"],
-                                    **predictor.predict(image, prompt)})
+                                    **predictor.predict(image, prompt, choices=choices)})
     return {"kind": "adapter_component_smoke", "not_a_scene_graph_benchmark": True,
-            "generation": {**DEFAULT_GENERATION, **(generation or {})}, "results": results}
+            "generation": {**DEFAULT_GENERATION, **(generation or {})},
+            "relationship_response_format": inference["relationship_response_format"], "results": results}
 
 
 def plot_graph(graph):

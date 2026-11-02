@@ -27,6 +27,8 @@ def main():
     with contextlib.redirect_stdout(sys.stderr):
         import lora_baseline as lb
         from . import scene_graph_pipeline as sg
+        from . import relation_choices as rc
+        config = rc.inference_settings(config)
         sg.validate_variant(config["project_root"], config["variant"])
         audit = sg.split_audit({"scene": config["scene"]}, config["variant"], config.get("split", "validation"))
         if config.get("split", "validation") in ("validation", "test") and any(
@@ -51,7 +53,16 @@ def main():
                         prompt = config.get("relation_prompt", lb.RELATION_PROMPT)
                     else:
                         raise ValueError("Worker operation must be object or relationship")
-                    answer = predictor.predict(image, prompt)
+                    choices = rc.LABELS if request["op"] == "relationship" and config.get("relationship_response_format") == rc.FORMAT else None
+                    answer = predictor.predict(image, prompt, choices=choices)
+                    if choices is not None:
+                        raw = answer["prediction"]
+                        choice = rc.parse_choice(raw)
+                        if choice is None:
+                            raise ValueError(f"Constrained relationship output is not a valid choice: {raw!r}")
+                        answer.update(prediction=choice, raw_prediction=raw,
+                                      choice_index=rc.LABELS.index(choice)+1, response_format=rc.FORMAT,
+                                      constrained_decoding=True)
                 print(json.dumps({"ok": True, **answer}), flush=True)
             except Exception as exc:
                 print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), flush=True)

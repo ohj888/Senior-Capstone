@@ -6,6 +6,7 @@ in-process by a local worker; an OpenAI client is never instantiated.
 """
 from contextlib import contextmanager
 import importlib
+from importlib.machinery import ModuleSpec
 import csv
 import json
 import os
@@ -50,6 +51,9 @@ class LocalWorker:
                          "loading": cfg.get("loading", {}), "generation": cfg.get("generation", {}),
                          "object_image_max_side": cfg.get("object_image_max_side", 384),
                          "relation_image_max_side": cfg.get("relation_image_max_side", 512)}
+        worker_config["relationship_response_format"] = cfg.get("relationship_response_format", "multiple_choice_v1")
+        if cfg.get("relation_choice_prompt"):
+            worker_config["relation_choice_prompt"] = cfg["relation_choice_prompt"]
         for key in ("object_prompt", "relation_prompt"):
             if key in cfg:
                 worker_config[key] = cfg[key]
@@ -109,6 +113,10 @@ def _local_completion_module(callback):
     """Supply only the interface used by upstream; prevent remote fallback."""
     previous = sys.modules.get("openai")
     stub = types.ModuleType("openai")
+    # Transformers checks optional packages with find_spec() during import.
+    # A manually created module otherwise has __spec__=None and breaks that
+    # check before the upstream graph builder can use our local callback.
+    stub.__spec__ = ModuleSpec("openai", loader=None)
     stub.ChatCompletion = types.SimpleNamespace(create=callback)
     sys.modules["openai"] = stub
     try:
@@ -121,7 +129,9 @@ def _local_completion_module(callback):
 
 
 def run_local_graph(settings, manifest):
-    cfg = settings["local_graph"]
+    from .relation_choices import inference_settings
+    cfg = inference_settings(settings["local_graph"])
+    settings = {**settings, "local_graph": cfg}
     if not cfg.get("variants"):
         raise ValueError("Select at least one local VLM variant")
     min_views = cfg.get("min_views_per_object", 2)
