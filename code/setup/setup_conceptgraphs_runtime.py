@@ -6,6 +6,7 @@ Existing Windows model-training packages and adapter weights are untouched.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import email
 import hashlib
 import json
 import os
@@ -16,11 +17,17 @@ import tarfile
 import time
 import urllib.request
 import urllib.error
+import zipfile
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / "dependencies/conceptgraphs-runtime"
 DISTRO = "Ubuntu"
+CUDA_HEADER_PACKAGES = {
+    "libcublas-dev-11.11.3.6-0.tar.bz2": "202e37cd0210a726da327d0d380bac3d9f320e6a71ff69dd5a902587c5580b0c",
+    "libcusolver-dev-11.4.1.48-0.tar.bz2": "04b4a8ba6268cad7a688b62948103e8b18d7086f1f0c55a80db5b0d6302b3dcf",
+    "libcusparse-dev-11.7.5.86-0.tar.bz2": "f8f48bd3ffad7bd915a68fab259826cc589ff084cdcb462e4da5250aee62621c",
+}
 
 
 def digest(path, algorithm="sha256"):
@@ -131,12 +138,77 @@ def pip_packages():
     # on Windows and then installed offline by Linux Python.
     subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(wheels),
                     "antlr4-python3-runtime==4.9.3", "fvcore==0.1.5.post20221221", "iopath==0.1.10", "fairscale==0.4.13",
-                    "pathtools==0.1.2", "lit==17.0.1"], check=True)
+                    "lit==17.0.1"], check=True)
+    # Open3D 0.18 publishes manylinux_2_27 wheels. pip's explicit --platform
+    # values do not automatically include every older glibc platform.
+    platforms = [arg for minor in range(28, 16, -1) for arg in ("--platform", f"manylinux_2_{minor}_x86_64")]
     subprocess.run([sys.executable, "-m", "pip", "download", "--dest", str(wheels), "--find-links", str(wheels),
-                    "--platform", "manylinux2014_x86_64", "--platform", "manylinux_2_28_x86_64",
+                    *platforms, "--platform", "manylinux2014_x86_64",
                     "--platform", "linux_x86_64", "--python-version", "310", "--implementation", "cp",
                     "--abi", "cp310", "--abi", "abi3", "--only-binary=:all:",
                     "-r", str(Path(__file__).with_name("conceptgraphs-runtime-requirements.txt"))], check=True)
+    complete_linux_wheels()
+
+
+def linux_wheel_gaps():
+    """Audit wheel dependency markers for the actual Linux/Python 3.10 target.
+
+    pip download's --platform selects wheels, but some dependency markers still
+    use the Windows host. Check the target's complete dependency tree explicitly.
+    """
+    from pip._vendor.packaging.markers import default_environment
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.utils import canonicalize_name
+    from pip._vendor.packaging.version import Version
+    records = {}
+    for path in (RUNTIME / "wheels").glob("*.whl"):
+        with zipfile.ZipFile(path) as archive:
+            metadata_path = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
+            meta = email.message_from_bytes(archive.read(metadata_path))
+        records.setdefault(canonicalize_name(meta["Name"]), []).append(
+            (Version(meta["Version"]), meta.get_all("Requires-Dist", [])))
+    environment = {**default_environment(), "sys_platform": "linux", "platform_system": "Linux",
+                   "os_name": "posix", "platform_machine": "x86_64", "python_version": "3.10",
+                   "python_full_version": "3.10.14", "implementation_name": "cpython",
+                   "implementation_version": "3.10.14", "extra": ""}
+    pending = [Requirement(line) for line in Path(__file__).with_name("conceptgraphs-runtime-requirements.txt").read_text().splitlines()
+               if line.strip() and not line.lstrip().startswith("#")]
+    seen, missing = set(), set()
+    while pending:
+        requirement = pending.pop()
+        name = canonicalize_name(requirement.name)
+        candidates = [row for row in records.get(name, []) if row[0] in requirement.specifier]
+        if not candidates:
+            extras = "[" + ",".join(sorted(requirement.extras)) + "]" if requirement.extras else ""
+            missing.add(requirement.name + extras + str(requirement.specifier))
+            continue
+        version, dependencies = max(candidates, key=lambda row: row[0])
+        key = (name, version, tuple(sorted(requirement.extras)))
+        if key in seen:
+            continue
+        seen.add(key)
+        for text in dependencies:
+            dependency = Requirement(text)
+            if dependency.marker is None or any(dependency.marker.evaluate({**environment, "extra": extra})
+                                                for extra in {"", *requirement.extras}):
+                pending.append(dependency)
+    return sorted(missing)
+
+
+def complete_linux_wheels():
+    """Fetch dependencies omitted by host markers, without changing any environment."""
+    previous = None
+    while missing := linux_wheel_gaps():
+        if missing == previous:
+            raise RuntimeError(f"Linux wheel dependency audit did not resolve: {missing}")
+        previous = missing
+        print("Additional Linux/Python 3.10 dependencies:", ", ".join(missing), flush=True)
+        platforms = [arg for minor in range(28, 16, -1) for arg in ("--platform", f"manylinux_2_{minor}_x86_64")]
+        subprocess.run([sys.executable, "-m", "pip", "download", "--dest", str(RUNTIME / "wheels"),
+                        "--no-deps", "--only-binary=:all:", *platforms, "--platform", "manylinux2014_x86_64",
+                        "--platform", "linux_x86_64", "--python-version", "310", "--implementation", "cp",
+                        "--abi", "cp310", "--abi", "abi3", *missing], check=True)
+    print("Linux/Python 3.10 wheel dependency audit passed", flush=True)
 
 
 def source(repo, ref, name):
@@ -206,31 +278,82 @@ def weights():
 
 
 def linux_path(path):
-    return subprocess.check_output(["wsl.exe", "-d", DISTRO, "--", "wslpath", "-u", str(Path(path).resolve())], text=True).strip()
+    return subprocess.check_output(["wsl.exe", "-d", DISTRO, "--exec", "wslpath", "-u", str(Path(path).resolve())], text=True).strip()
 
 
 def install(args):
     """Install only into the named isolated WSL environment, from local files."""
     prefix, conda = args.env_prefix, args.linux_conda
-    launch = ["wsl.exe", "-d", DISTRO, "--"]
+    missing = linux_wheel_gaps()
+    if missing:
+        raise RuntimeError(f"Offline wheel cache is incomplete: {missing}. Run the pip setup stage to fill it.")
+    for filename, checksum in CUDA_HEADER_PACKAGES.items():
+        package = RUNTIME / "conda-packages" / filename
+        if not package.is_file() or digest(package) != checksum:
+            raise RuntimeError(f"Missing verified CUDA development package {filename}; run the cuda-headers setup stage.")
+    launch = ["wsl.exe", "-d", DISTRO, "--exec"]
     # Explicit conda archives are self-contained and do not invoke a solver.
     exists = subprocess.run([*launch, "test", "-x", prefix + "/bin/python"]).returncode == 0
     subprocess.run([*launch, conda, "install" if exists else "create", "--yes", "--offline", "--prefix", prefix,
                     "--file", linux_path(RUNTIME / "conda-explicit.txt")], check=True)
+    # pip splits PIP_FIND_LINKS on whitespace; a file URI preserves spaces in
+    # the workspace name for both direct pip and any build subprocesses.
+    wheel_url = "file://" + quote(linux_path(RUNTIME / "wheels"))
     pip = [*launch, conda, "run", "--no-capture-output", "-p", prefix, "env",
            f"CUDA_HOME={prefix}", f"MAX_JOBS={args.build_jobs}", f"TORCH_CUDA_ARCH_LIST={args.cuda_arch}",
-           "FORCE_CUDA=1", "PIP_NO_INDEX=1", f"PIP_FIND_LINKS={linux_path(RUNTIME / 'wheels')}",
+           "FORCE_CUDA=1", "PIP_NO_INDEX=1", f"PIP_FIND_LINKS={wheel_url}",
            prefix + "/bin/python", "-m", "pip", "install", "--no-index",
-           "--find-links", linux_path(RUNTIME / "wheels")]
+           "--find-links", wheel_url]
     subprocess.run([*pip, "-r", linux_path(Path(__file__).with_name("conceptgraphs-runtime-requirements.txt"))], check=True)
     # PyTorch3D's published binary matches Python 3.10 / Torch 2.0.1 / CUDA 11.8.
     package = RUNTIME / "conda-packages/pytorch3d-0.7.4-py310_cu118_pyt201.tar.bz2"
     subprocess.run([*launch, conda, "install", "--yes", "--offline", "--no-deps", "-p", prefix, linux_path(package)], check=True)
+    # Torch's cu118 wheel already supplies the runtime libraries. These matching
+    # development packages supply headers needed by ATen's extension interface.
+    subprocess.run([*launch, conda, "install", "--yes", "--offline", "--no-deps", "-p", prefix,
+                    *[linux_path(RUNTIME / "conda-packages" / filename) for filename in CUDA_HEADER_PACKAGES]], check=True)
     for relative in ("src/chamferdist", "src/gradslam", "src/Grounded-Segment-Anything/GroundingDINO",
                      "src/Grounded-Segment-Anything/segment_anything", "src/recognize-anything"):
-        subprocess.run([*pip, "--no-build-isolation", "--no-deps", linux_path(RUNTIME / relative)], check=True)
+        source_path = linux_path(RUNTIME / relative)
+        if relative in ("src/chamferdist", "src/Grounded-Segment-Anything/GroundingDINO"):
+            # Native compiler include arguments from upstream do not consistently
+            # quote spaces. Build a copy on the local Linux filesystem.
+            build_path = prefix + "/src/conceptgraphs/" + PurePosixPath(relative).name
+            copy_source = ("import shutil,sys; from pathlib import Path; "
+                           "source,target,prefix=map(Path,sys.argv[1:]); "
+                           "assert target.resolve().is_relative_to(prefix.resolve()) and target.resolve()!=prefix.resolve(); "
+                           "shutil.copytree(source,target,dirs_exist_ok=True,ignore=shutil.ignore_patterns('build','*.egg-info','__pycache__'))")
+            subprocess.run([*launch, prefix + "/bin/python", "-c", copy_source, source_path, build_path, prefix], check=True)
+            source_path = build_path
+        subprocess.run([*pip, "--no-build-isolation", "--no-deps", source_path], check=True)
     subprocess.run([*pip, "--no-build-isolation", "--no-deps", "-e", linux_path(ROOT / "dependencies/concept-graphs")], check=True)
-    check = "import torch,cv2,open3d,open_clip,faiss,pytorch3d,groundingdino,segment_anything,ram,gradslam; print('Mapping imports OK; CUDA:',torch.cuda.is_available())"
+    check = """
+import torch, cv2, open3d, open_clip, faiss, segment_anything, ram, gradslam
+from groundingdino import _C
+from groundingdino.util.inference import Model
+from ram.models import ram as ram_model
+from chamferdist import ChamferDistance
+from pytorch3d.ops import knn_points
+from torchvision.ops import nms
+import conceptgraph.dataset.datasets_common
+import conceptgraph.slam.cfslam_pipeline_batch
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+points = torch.tensor([[[0., 0., 0.], [1., 0., 0.]]], device=device)
+assert ChamferDistance()(points, points).item() == 0
+assert knn_points(points, points, K=1).dists.sum().item() == 0
+boxes = torch.tensor([[0., 0., 2., 2.], [0., 0., 2., 2.]], device=device)
+assert nms(boxes, torch.tensor([.9, .8], device=device), .5).tolist() == [0]
+if device == 'cuda':
+    value = torch.ones((1, 4, 1, 2), device=device)
+    shapes = torch.tensor([[2, 2]], dtype=torch.long, device=device)
+    starts = torch.zeros(1, dtype=torch.long, device=device)
+    locations = torch.full((1, 1, 1, 1, 1, 2), .5, device=device)
+    weights = torch.ones((1, 1, 1, 1, 1), device=device)
+    output = _C.ms_deform_attn_forward(value, shapes, starts, locations, weights, 64)
+    assert torch.allclose(output, torch.ones_like(output))
+    torch.cuda.synchronize()
+print('Mapping imports and native operations passed; device:', device)
+"""
     subprocess.run([*launch, prefix + "/bin/python", "-c", check], check=True)
     (RUNTIME / "installed.json").write_text(json.dumps({"distro": DISTRO, "python": prefix + "/bin/python",
                                                        "cuda_arch": args.cuda_arch}, indent=2), encoding="utf-8")
@@ -242,10 +365,16 @@ def pytorch3d():
              RUNTIME / "conda-packages" / filename)
 
 
+def cuda_headers():
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda item: download("https://conda.anaconda.org/nvidia/linux-64/" + item[0],
+                                           RUNTIME / "conda-packages" / item[0], sha256=item[1]), CUDA_HEADER_PACKAGES.items()))
+
+
 def main():
     global DISTRO, RUNTIME
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["all", "resolve", "conda", "sources", "torch", "pip", "weights", "pytorch3d", "install"])
+    parser.add_argument("action", choices=["all", "resolve", "conda", "sources", "torch", "pip", "weights", "pytorch3d", "cuda-headers", "install"])
     parser.add_argument("--distro", default="Ubuntu")
     parser.add_argument("--runtime-root", type=Path, default=RUNTIME)
     parser.add_argument("--env-prefix", help="Isolated WSL environment; defaults to ~/miniconda3/envs/conceptgraphs-pilot")
@@ -256,13 +385,13 @@ def main():
     DISTRO, RUNTIME = args.distro, args.runtime_root.resolve()
     RUNTIME.mkdir(parents=True, exist_ok=True)
     if args.action in ("install", "all"):
-        home = subprocess.check_output(["wsl.exe", "-d", DISTRO, "--", "printenv", "HOME"], text=True).strip()
+        home = subprocess.check_output(["wsl.exe", "-d", DISTRO, "--exec", "printenv", "HOME"], text=True).strip()
         args.env_prefix = args.env_prefix or home + "/miniconda3/envs/conceptgraphs-pilot"
         args.linux_conda = args.linux_conda or home + "/miniconda3/bin/conda"
         if args.env_prefix.rstrip("/") in (home, "", str(PurePosixPath(args.linux_conda).parent.parent)):
             raise ValueError("Choose an isolated environment, not the home or base environment")
     actions = {"resolve": resolve, "conda": conda_packages, "sources": sources, "torch": torch_wheels,
-               "pip": pip_packages, "weights": weights, "pytorch3d": pytorch3d, "install": lambda: install(args)}
+               "pip": pip_packages, "weights": weights, "pytorch3d": pytorch3d, "cuda-headers": cuda_headers, "install": lambda: install(args)}
     for name in (actions if args.action == "all" else (args.action,)):
         if name == "resolve" and args.action == "all":
             saved_plan = RUNTIME / "conda-plan-cuda118.json"

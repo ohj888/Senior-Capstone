@@ -629,7 +629,9 @@ def run_local_pipeline(config, actions=("prepare", "detect", "map", "graph"), *,
         def translate(value):
             if value is None or not re.match(r"^[A-Za-z]:[\\/]", str(value)):
                 return value
-            return subprocess.check_output(["wsl.exe", "-d", wsl_distro, "--", "wslpath", "-u", str(value)], text=True).strip()
+            # --exec bypasses the WSL shell, which would consume backslashes
+            # in unquoted Windows paths such as C:\ProgramData\...\python.exe.
+            return subprocess.check_output(["wsl.exe", "-d", wsl_distro, "--exec", "wslpath", "-u", str(value)], text=True).strip()
         for key in ("data_root", "run_dir", "conceptgraphs_root"):
             runtime[key] = translate(settings[key])
         runtime["python_executable"] = linux_python
@@ -639,7 +641,7 @@ def run_local_pipeline(config, actions=("prepare", "detect", "map", "graph"), *,
         if runtime["local_graph"].get("worker_python"):
             runtime["local_graph"]["worker_python"] = translate(runtime["local_graph"]["worker_python"])
         script = translate(str(Path(__file__).resolve()))
-        command = ["wsl.exe", "-d", wsl_distro, "--", linux_python, "-u", script,
+        command = ["wsl.exe", "-d", wsl_distro, "--exec", linux_python, "-u", script,
                    "--stage", "pipeline", "--config", translate(str(control)), "--actions", *actions]
     else:
         command = [settings["python_executable"], "-u", str(Path(__file__).resolve()),

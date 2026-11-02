@@ -66,24 +66,25 @@ def local_runs(root):
 def default_variants(root):
     """Explicit model/task conditions. A missing requested adapter is an error.
 
-    SmolVLM has an object adapter in the current repository, but no relationship
-    adapter. Its condition name records that relationship inference is pretrained.
-    Set relationship_run to a completed SmolVLM run to add that experiment later.
+    Both models have separate saved object and relationship runs. Pretrained
+    conditions use their run metadata without enabling either adapter; adapted
+    conditions enable the matching adapter for each task.
     """
     root = Path(root)
     qobj = str(root / "artifacts/objects/qwen/objects_3epochs")
     sobj = str(root / "artifacts/objects/smolvlm/objects_3epochs")
     qrel = str(root / "artifacts/relationships/qwen/relations_3epochs")
+    srel = str(root / "artifacts/relationships/smolvlm/relations_3epochs")
     return [
         {"name": "qwen_pretrained", "model_key": "qwen", "object_run": qobj,
          "relationship_run": qrel, "object_adapter": False, "relationship_adapter": False},
         {"name": "qwen_adapted", "model_key": "qwen", "object_run": qobj,
          "relationship_run": qrel, "object_adapter": True, "relationship_adapter": True},
         {"name": "smolvlm_pretrained", "model_key": "smolvlm", "object_run": sobj,
-         "relationship_run": None, "object_adapter": False, "relationship_adapter": False},
-        {"name": "smolvlm_objects_adapted_relations_pretrained", "model_key": "smolvlm",
-         "object_run": sobj, "relationship_run": None, "object_adapter": True,
-         "relationship_adapter": False},
+         "relationship_run": srel, "object_adapter": False, "relationship_adapter": False},
+        {"name": "smolvlm_adapted", "model_key": "smolvlm",
+         "object_run": sobj, "relationship_run": srel, "object_adapter": True,
+         "relationship_adapter": True},
     ]
 
 
